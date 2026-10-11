@@ -450,11 +450,32 @@ async function loadAlbums() {
   renderAlbumList();
   renderDisplay(results[1]);
 }
-async function uploadAlbumImage(file) {
-  if (!file) return;
+async function uploadAlbumImages(fileList) {
+  const files = [...fileList];
   byId("album-image-file").value = "";
-  closeAlbumPicker();
-  openImageEditor("album-upload", null, file, true);
+  if (!files.length) return;
+  if (files.length === 1) {
+    closeAlbumPicker();
+    openImageEditor("album-upload", null, files[0], true);
+    return;
+  }
+  const failures = [];
+  let added = 0;
+  for (const [index, file] of files.entries()) {
+    setMessage("album-picker-message", "Uploading " + (index + 1) + " of " + files.length + "…");
+    try {
+      const asset = await uploadAssetFile(file);
+      state.albumAssets.set(asset.id, asset);
+      if (!state.pickerAssets.some((item) => item.id === asset.id)) state.pickerAssets.unshift(asset);
+      // Identical files collapse onto one asset server-side, so only count new playlist entries.
+      if (state.albumDraftIds.includes(asset.id)) continue;
+      state.albumDraftIds.push(asset.id);
+      added += 1;
+    } catch (error) { failures.push(file.name + " (" + error.message + ")"); }
+  }
+  renderAlbumPlaylist(); renderAlbumPicker();
+  const summary = added + " image" + (added === 1 ? "" : "s") + " added to this album. Each uses crop framing; edit any image from the gallery to change it.";
+  setMessage("album-picker-message", failures.length ? summary + " Skipped " + failures.length + ": " + failures.join(", ") : summary, failures.length ? "error" : "");
 }
 async function stopPlayback() {
   const button = byId("stop-playback");
@@ -529,7 +550,7 @@ byId("album-search").addEventListener("input", (event) => {
   clearTimeout(state.pickerTimer);
   state.pickerTimer = setTimeout(() => resetAlbumPicker(), 200);
 });
-byId("album-image-file").addEventListener("change", (event) => uploadAlbumImage(event.target.files[0]));
+byId("album-image-file").addEventListener("change", (event) => uploadAlbumImages(event.target.files));
 byId("album-form").addEventListener("submit", saveAlbum);
 byId("close-image-editor").addEventListener("click", closeImageEditor);
 byId("save-image-editor").addEventListener("click", saveImageEditor);
