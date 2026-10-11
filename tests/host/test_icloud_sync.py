@@ -108,11 +108,15 @@ def test_an_unchanged_ctag_costs_one_request_and_no_downloads(tmp_path: Path) ->
         assert remote.asset_url_calls == 1
 
 
-def test_a_photo_removed_upstream_leaves_the_album_but_stays_in_the_gallery(tmp_path: Path) -> None:
+def test_a_photo_removed_upstream_is_deleted_from_the_gallery_too(tmp_path: Path) -> None:
+    """The gallery mirrors the shared album, so dropping a photo there removes it here."""
+
     remote = FakeIcloud()
     settings = Settings(data_dir=tmp_path / "data", environment="test", icloud_sync_enabled=False)
     with TestClient(create_app(settings, remote.factory())) as client:
         link = link_album(client)
+        stored = {Path(asset["id"]) for asset in client.get("/api/v1/assets").json()}
+        assert len(stored) == 2
 
         del remote.photos["guid-2"]
         remote.ctag = "ctag-2"
@@ -120,9 +124,37 @@ def test_a_photo_removed_upstream_leaves_the_album_but_stays_in_the_gallery(tmp_
 
         album = client.get(f"/api/v1/albums/{link['album_id']}").json()
         assert len(album["items"]) == 1
-        gallery = client.get("/api/v1/assets").json()
-        assert len(gallery) == 2
-        assert all(asset["deleted_at"] is None for asset in gallery)
+        assert len(client.get("/api/v1/assets").json()) == 1
+
+    sessions = create_session_factory(settings)
+    with sessions() as session:
+        assert session.query(AssetRecord).count() == 1
+        # The bytes are gone from disk as well, not merely hidden from the gallery.
+        originals = list((tmp_path / "data" / "originals").rglob("*"))
+        assert len([path for path in originals if path.is_file()]) == 1
+
+
+def test_a_removed_photo_whose_bytes_another_album_uses_is_kept(tmp_path: Path) -> None:
+    """Assets are content addressed, so a hand-built playlist must survive the mirror."""
+
+    remote = FakeIcloud()
+    settings = Settings(data_dir=tmp_path / "data", environment="test", icloud_sync_enabled=False)
+    with TestClient(create_app(settings, remote.factory())) as client:
+        link = link_album(client)
+        shared = client.get(f"/api/v1/albums/{link['album_id']}").json()["items"][1]["asset_id"]
+        keeper = client.post(
+            "/api/v1/albums",
+            json={"name": "Hand picked", "asset_ids": [shared], "display_id": "inky-main"},
+        )
+        assert keeper.status_code == 201, keeper.text
+
+        remote.photos = {"guid-1": remote.photos["guid-1"]}
+        remote.ctag = "ctag-2"
+        client.post(f"/api/v1/icloud/links/{link['id']}/sync")
+
+        assert len(client.get("/api/v1/assets").json()) == 2
+        kept = client.get(f"/api/v1/albums/{keeper.json()['id']}").json()
+        assert [item["asset_id"] for item in kept["items"]] == [shared]
 
 
 def test_identical_photos_collapse_onto_one_asset(tmp_path: Path) -> None:

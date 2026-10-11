@@ -49,7 +49,7 @@ from .api_models import (
     JobResponse,
     QuickPlayRequest,
 )
-from .assets import upsert_asset
+from .assets import purge_assets, upsert_asset
 from .config import Settings
 from .database import (
     AlbumItemRecord,
@@ -117,43 +117,9 @@ def _delete_assets(asset_ids: list[str], request: Request) -> DeleteResult:
         if missing:
             raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="One or more assets were not found")
 
-        jobs = session.scalars(
-            select(DisplayJobRecord).where(DisplayJobRecord.asset_id.in_(unique_ids))
-        ).all()
-        artifacts = session.scalars(
-            select(ArtifactRecord).where(ArtifactRecord.asset_id.in_(unique_ids))
-        ).all()
-        job_ids = {job.id for job in jobs}
-        artifact_ids = {artifact.id for artifact in artifacts}
-
-        for display in session.scalars(select(DisplayRecord)).all():
-            if display.desired_job_id in job_ids or display.desired_artifact_id in artifact_ids:
-                display.desired_job_id = None
-                display.desired_artifact_id = None
-
-        affected_album_ids = set(
-            session.scalars(select(AlbumItemRecord.album_id).where(AlbumItemRecord.asset_id.in_(unique_ids))).all()
-        )
-        session.execute(delete(AlbumItemRecord).where(AlbumItemRecord.asset_id.in_(unique_ids)))
-        for album_id in affected_album_ids:
-            album = session.get(AlbumRecord, album_id)
-            has_items = session.scalar(select(AlbumItemRecord.id).where(AlbumItemRecord.album_id == album_id))
-            if album is not None and not has_items:
-                album.is_running = False
-                album.next_run_at = None
-
-        session.execute(delete(DisplayJobRecord).where(DisplayJobRecord.asset_id.in_(unique_ids)))
-        session.execute(delete(ArtifactRecord).where(ArtifactRecord.asset_id.in_(unique_ids)))
-        for asset in assets.values():
-            assert asset is not None
-            session.delete(asset)
+        purged = purge_assets(session, unique_ids)
         try:
-            for asset in assets.values():
-                assert asset is not None
-                storage.remove(asset.storage_path)
-            for artifact in artifacts:
-                storage.remove(artifact.storage_path)
-                storage.remove_preview(artifact.sha256)
+            purged.remove_from(storage)
         except (OSError, ValueError) as error:
             session.rollback()
             raise HTTPException(

@@ -14,7 +14,7 @@ from sqlalchemy import delete, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, sessionmaker
 
-from .assets import UnsupportedImageError, upsert_asset, validate_stored_image
+from .assets import PurgedFiles, UnsupportedImageError, purge_assets, upsert_asset, validate_stored_image
 from .config import Settings
 from .database import (
     AlbumItemRecord,
@@ -257,12 +257,14 @@ class IcloudSyncService:
 
     def _record_success(self, link_id: str, stream: IcloudStream, rebuild: bool) -> None:
         now = utc_now()
+        purged = PurgedFiles((), ())
         with self._sessions() as session:
             link = session.get(IcloudAlbumLinkRecord, link_id)
             if link is None:
                 return
             if rebuild:
                 link.photo_count = self._rebuild_playlist(session, link)
+                purged = self._purge_removed_photos(session, link)
             link.base_url = stream.base_url
             link.stream_name = stream.stream_name
             link.stream_ctag = stream.stream_ctag
@@ -271,6 +273,44 @@ class IcloudSyncService:
             link.last_success_at = now
             link.next_sync_at = now + timedelta(seconds=link.sync_interval_seconds)
             session.commit()
+        # Only once the rows are committed, so a crash leaves an unreferenced file rather
+        # than a row pointing at bytes that are gone.
+        try:
+            purged.remove_from(self._storage)
+        except (OSError, ValueError):
+            logger.warning("could not remove files for photos dropped from the album: link=%s", link_id)
+
+    def _purge_removed_photos(self, session: Session, link: IcloudAlbumLinkRecord) -> PurgedFiles:
+        """Delete the photos the shared album no longer holds, so the gallery mirrors it.
+
+        Assets are content addressed, so the bytes may be shared with a photo that is still
+        in a linked album or with a playlist built by hand. Those keep the asset alive; only
+        the ones nothing else refers to are deleted.
+        """
+
+        removed = session.scalars(
+            select(IcloudPhotoRecord).where(
+                IcloudPhotoRecord.link_id == link.id, IcloudPhotoRecord.removed_at.is_not(None)
+            )
+        ).all()
+        if not removed:
+            return PurgedFiles((), ())
+
+        candidates = {record.asset_id for record in removed if record.asset_id is not None}
+        for record in removed:
+            session.delete(record)
+        session.flush()
+
+        still_wanted = set(
+            session.scalars(
+                select(IcloudPhotoRecord.asset_id).where(IcloudPhotoRecord.asset_id.in_(candidates))
+            ).all()
+        ) | set(
+            session.scalars(
+                select(AlbumItemRecord.asset_id).where(AlbumItemRecord.asset_id.in_(candidates))
+            ).all()
+        )
+        return purge_assets(session, sorted(candidates - still_wanted))
 
     def _rebuild_playlist(self, session: Session, link: IcloudAlbumLinkRecord) -> int:
         """Replace the album's items in one transaction.
