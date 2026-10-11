@@ -13,7 +13,7 @@
 Requirements: Git, Docker Engine, and the Docker Compose plugin.
 
 ```bash
-git clone <repository-url> inky
+git clone https://github.com/simonottosen/e-ink-display-server.git inky
 cd inky
 cp .env.example .env
 docker compose -f deploy/docker/compose.yaml up -d --build host
@@ -35,7 +35,7 @@ docker compose -f deploy/docker/compose.yaml up -d --build host
 sudo apt update
 sudo apt install -y git docker.io docker-compose-plugin
 sudo systemctl enable --now docker
-git clone <repository-url> inky
+git clone https://github.com/simonottosen/e-ink-display-server.git inky
 cd inky
 cp .env.example .env
 docker compose -f deploy/docker/compose.yaml up -d --build host
@@ -43,6 +43,31 @@ docker compose -f deploy/docker/compose.yaml up -d --build host
 
 The web host listens on port `8000` by default. Set `INKY_HOST_PORT` in `.env`
 to publish a different port.
+
+## Shared iCloud album
+
+Paste a shared album link (`https://www.icloud.com/sharedalbum/#...`) into the
+web UI and the host builds a shuffling album from it, re-checking every 15
+minutes. The gallery mirrors the album: a photo removed in iCloud is removed
+here too, including its file on disk, unless another album still uses it.
+
+The link token is a bearer capability, so it is never returned by the API or
+written to the logs.
+
+## Persisting data outside Compose
+
+`INKY_DATA_DIR` defaults to a relative `data` path, which resolves inside the
+container's writable layer. Compose covers this already, but any other
+deployment must both mount a volume and point the setting at it, or every
+container recreate starts from an empty database:
+
+```
+volume:       /your/host/path:/var/lib/inky
+environment:  INKY_DATA_DIR=/var/lib/inky
+```
+
+Mounting alone is not enough — without the environment variable the app keeps
+writing to the old path and ignores the mount.
 
 ## Pi agent
 
