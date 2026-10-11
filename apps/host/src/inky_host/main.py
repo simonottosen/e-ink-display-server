@@ -217,6 +217,24 @@ def _display_response(session: Session, display: DisplayRecord) -> DisplayRespon
     )
 
 
+def _report_stale_agent_revision(session: Session, display: DisplayRecord, agent_revision: int) -> None:
+    """Surface a revision counter left over from an earlier database, which is otherwise silent."""
+
+    message = (
+        f"The display agent reported revision {agent_revision}, which this host has never issued "
+        f"(the latest is {display.desired_revision}). Its saved state is left over from an earlier "
+        "host database, so the agent will ignore new images. Delete state.json in the agent data "
+        "directory and restart the agent."
+    )
+    # Agents poll every few seconds; only record a change so the log and the dashboard
+    # do not fill with repeats of a condition that is already reported.
+    if display.last_error == message:
+        return
+    logger.warning(message)
+    display.last_error = message
+    session.commit()
+
+
 def _job_album(session: Session, job: DisplayJobRecord | None) -> AlbumRecord | None:
     if job is None:
         return None
@@ -696,9 +714,18 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             display = session.get(DisplayRecord, display_id)
             if display is None:
                 raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Display not found")
+            # Revisions count up from zero in this database. An agent reporting a revision we
+            # never issued kept its state across a host database reset, so its counter says
+            # nothing about what is on the panel and comparing against it would strand the
+            # display until we caught back up.
+            agent_predates_this_database = current_revision > display.desired_revision
+            if agent_predates_this_database:
+                _report_stale_agent_revision(session, display, current_revision)
             job = session.get(DisplayJobRecord, display.desired_job_id) if display and display.desired_job_id else None
             artifact = session.get(ArtifactRecord, job.artifact_id) if job and job.artifact_id else None
-            if job is None or artifact is None or job.revision is None or job.revision <= current_revision:
+            if job is None or artifact is None or job.revision is None:
+                return Response(status_code=status.HTTP_204_NO_CONTENT)
+            if job.revision <= current_revision and not agent_predates_this_database:
                 return Response(status_code=status.HTTP_204_NO_CONTENT)
             return DesiredState(
                 display_id=display_id,

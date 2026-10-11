@@ -79,6 +79,45 @@ def test_health_and_upload_to_desired_state(tmp_path: Path) -> None:
         assert client.get("/api/v1/displays/inky-main").json()["current_revision"] == 1
 
 
+def test_agent_from_a_previous_database_still_receives_the_desired_state(tmp_path: Path) -> None:
+    settings = Settings(data_dir=tmp_path / "data", environment="test")
+    with TestClient(create_app(settings)) as client:
+        upload = client.post("/api/v1/assets", files={"file": ("sky.png", png_upload(), "image/png")})
+        queued = client.post(
+            "/api/v1/displays/inky-main/display-now",
+            json={"asset_id": upload.json()["id"]},
+        )
+        job_id = queued.json()["id"]
+        for _ in range(30):
+            job = client.get(f"/api/v1/jobs/{job_id}").json()
+            if job["status"] in {"ready", "failed"}:
+                break
+            time.sleep(0.05)
+        assert job["status"] == "ready"
+
+        stranded = client.get("/api/v1/displays/inky-main/desired?current_revision=194")
+        assert stranded.status_code == 200
+        revision = stranded.json()["revision"]
+        assert revision == 1
+
+        reported = client.get("/api/v1/displays/inky-main").json()["last_error"]
+        assert "194" in reported
+        assert "state.json" in reported
+
+        completed = JobAcknowledgement(
+            event=JobEvent.COMPLETED,
+            completed_revision=revision,
+            occurred_at="2026-01-01T00:00:01Z",
+        )
+        client.post(
+            f"/api/v1/displays/inky-main/jobs/{job_id}/completed",
+            json=completed.model_dump(mode="json"),
+        )
+        caught_up = client.get(f"/api/v1/displays/inky-main/desired?current_revision={revision}")
+        assert caught_up.status_code == 204
+        assert client.get("/api/v1/displays/inky-main").json()["last_error"] is None
+
+
 def test_upload_rejects_unsupported_content_type(tmp_path: Path) -> None:
     settings = Settings(data_dir=tmp_path / "data", environment="test")
     with TestClient(create_app(settings)) as client:
