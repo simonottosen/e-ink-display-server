@@ -3,9 +3,27 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import TYPE_CHECKING
 
-from sqlalchemy import JSON, Boolean, DateTime, Engine, ForeignKey, Integer, String, Text, create_engine, text
+from sqlalchemy import (
+    JSON,
+    Boolean,
+    DateTime,
+    Engine,
+    ForeignKey,
+    Integer,
+    String,
+    Text,
+    UniqueConstraint,
+    create_engine,
+    event,
+    text,
+)
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
+from sqlalchemy.pool import ConnectionPoolEntry
+
+if TYPE_CHECKING:
+    from sqlalchemy.engine.interfaces import DBAPIConnection
 
 from inky_contract import RenderSettings
 
@@ -122,6 +140,48 @@ class AlbumItemRecord(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
 
 
+class IcloudAlbumLinkRecord(Base):
+    __tablename__ = "icloud_album_links"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    album_id: Mapped[str] = mapped_column(ForeignKey("albums.id"), unique=True, index=True)
+    # The token is a bearer capability: anyone holding it can read the whole album. It is
+    # unique so the same album cannot be linked twice and have two syncs fight over the rows.
+    token: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    share_url: Mapped[str] = mapped_column(Text)
+    base_url: Mapped[str] = mapped_column(Text)
+    stream_name: Mapped[str] = mapped_column(String(255), default="")
+    stream_ctag: Mapped[str] = mapped_column(String(128), default="")
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True, index=True)
+    sync_interval_seconds: Mapped[int] = mapped_column(Integer, default=900)
+    next_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    last_sync_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, default=0)
+    photo_count: Mapped[int] = mapped_column(Integer, default=0)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now, onupdate=utc_now)
+
+
+class IcloudPhotoRecord(Base):
+    __tablename__ = "icloud_photos"
+    __table_args__ = (UniqueConstraint("link_id", "photo_guid", name="uq_icloud_photo_guid"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    link_id: Mapped[str] = mapped_column(ForeignKey("icloud_album_links.id"), index=True)
+    photo_guid: Mapped[str] = mapped_column(String(128))
+    checksum: Mapped[str] = mapped_column(String(128), default="")
+    caption: Mapped[str | None] = mapped_column(Text, nullable=True)
+    date_created: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    asset_id: Mapped[str | None] = mapped_column(ForeignKey("assets.id"), nullable=True, index=True)
+    first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    last_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utc_now)
+    # A tombstone, not a delete: the photo leaves the playlist but its asset stays in the gallery.
+    removed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True, index=True)
+    download_error: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+
 def _apply_sqlite_migrations(engine: Engine) -> None:
     """Add columns needed when an existing SQLite file is opened by newer code."""
 
@@ -142,10 +202,31 @@ def _apply_sqlite_migrations(engine: Engine) -> None:
             connection.execute(text("ALTER TABLE albums ADD COLUMN is_temporary BOOLEAN NOT NULL DEFAULT 0"))
 
 
+def _configure_sqlite(engine: Engine) -> None:
+    """Let the render worker, the album scheduler, and the iCloud sync write concurrently.
+
+    The default rollback journal blocks readers during a write and fails immediately on a
+    locked database, which surfaces as an album that silently stops advancing.
+    """
+
+    if engine.dialect.name != "sqlite":
+        return
+
+    @event.listens_for(engine, "connect")
+    def set_pragmas(connection: DBAPIConnection, _record: ConnectionPoolEntry) -> None:
+        cursor = connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA busy_timeout=5000")
+        finally:
+            cursor.close()
+
+
 def create_session_factory(settings: Settings) -> sessionmaker[Session]:
     settings.data_dir.mkdir(parents=True, exist_ok=True)
     connect_args = {"check_same_thread": False} if settings.resolved_database_url.startswith("sqlite") else {}
     engine = create_engine(settings.resolved_database_url, connect_args=connect_args)
+    _configure_sqlite(engine)
     Base.metadata.create_all(engine)
     _apply_sqlite_migrations(engine)
     return sessionmaker(engine, expire_on_commit=False)

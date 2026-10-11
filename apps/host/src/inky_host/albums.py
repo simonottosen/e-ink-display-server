@@ -189,10 +189,12 @@ class AlbumScheduler:
         return job_ids
 
     def _queue_next_item(self, session: Session, album: AlbumRecord, now: datetime) -> str | None:
-        items = session.scalars(
-            select(AlbumItemRecord).where(AlbumItemRecord.album_id == album.id).order_by(AlbumItemRecord.position)
+        valid_items = session.scalars(
+            select(AlbumItemRecord)
+            .join(AssetRecord, AssetRecord.id == AlbumItemRecord.asset_id)
+            .where(AlbumItemRecord.album_id == album.id, AssetRecord.deleted_at.is_(None))
+            .order_by(AlbumItemRecord.position)
         ).all()
-        valid_items = [item for item in items if _is_available_asset(session, item.asset_id)]
         if not valid_items:
             album.is_running = False
             return None
@@ -211,11 +213,6 @@ class AlbumScheduler:
         job = create_display_now_job(session, display, asset, settings, album_id=album.id)
         album.next_run_at = now + timedelta(seconds=album.interval_seconds)
         return job.id
-
-
-def _is_available_asset(session: Session, asset_id: str) -> bool:
-    asset = session.get(AssetRecord, asset_id)
-    return asset is not None and asset.deleted_at is None
 
 
 def stop_running_albums(session: Session, display_id: str) -> list[AlbumRecord]:

@@ -1,7 +1,7 @@
 const displayId = "inky-main";
 const state = {
   display: null, sourceFile: null, sourceImage: null, sourceUrl: null, uploadedAsset: null,
-  albums: [], albumAssets: new Map(), albumDraftIds: [], editingAlbumId: null,
+  albums: [], albumAssets: new Map(), albumDraftIds: [], editingAlbumId: null, icloudLinks: [],
   pickerAssets: [], pickerOffset: 0, pickerHasMore: true, pickerLoading: false, pickerQuery: "", pickerTimer: null,
   imageEditor: { mode: null, asset: null, file: null, image: null, sourceUrl: null, returnToAlbumPicker: false },
 };
@@ -429,7 +429,8 @@ function editAlbum(album) {
   setMessage("album-picker-message", ""); renderAlbumPlaylist(); showAlbumEditor(); window.scrollTo({ top: 0, behavior: "smooth" });
 }
 function renderAlbumList() {
-  byId("album-list").innerHTML = state.albums.map((album) => '<article class="album-card"><div class="album-card-content"><div><p class="eyebrow">' + (album.is_running ? "RUNNING NOW" : "ALBUM") + "</p><h3>" + escapeHtml(album.name) + "</h3><p>" + album.items.length + " image" + (album.items.length === 1 ? "" : "s") + " · " + (album.order_mode === "shuffle" ? "Shuffle" : "In order") + " · every " + Math.round(album.interval_seconds / 60) + ' minutes</p></div><div class="album-thumbs">' + (album.items.slice(0, 6).map((item) => assetPreview(item.asset, "album-thumb")).join("") || "<span>Empty</span>") + '</div></div><div class="album-actions"><button data-run="' + album.id + '" type="button">' + (album.is_running ? "Restart" : "Run") + '</button><button data-stop="' + album.id + '" class="secondary" type="button" ' + (album.is_running ? "" : "disabled") + '>Stop</button><button data-edit="' + album.id + '" class="secondary" type="button">Edit</button><button data-delete-album="' + album.id + '" class="danger" type="button">Delete</button></div></article>').join("") || '<p class="empty">No albums yet. Create one when you are ready.</p>';
+  const linkedAlbumIds = new Set(state.icloudLinks.map((link) => link.album_id));
+  byId("album-list").innerHTML = state.albums.map((album) => '<article class="album-card"><div class="album-card-content"><div><p class="eyebrow">' + (album.is_running ? "RUNNING NOW" : linkedAlbumIds.has(album.id) ? "ICLOUD ALBUM" : "ALBUM") + "</p><h3>" + escapeHtml(album.name) + "</h3><p>" + album.items.length + " image" + (album.items.length === 1 ? "" : "s") + " · " + (album.order_mode === "shuffle" ? "Shuffle" : "In order") + " · every " + Math.round(album.interval_seconds / 60) + ' minutes</p></div><div class="album-thumbs">' + (album.items.slice(0, 6).map((item) => assetPreview(item.asset, "album-thumb")).join("") || "<span>Empty</span>") + '</div></div><div class="album-actions"><button data-run="' + album.id + '" type="button">' + (album.is_running ? "Restart" : "Run") + '</button><button data-stop="' + album.id + '" class="secondary" type="button" ' + (album.is_running ? "" : "disabled") + '>Stop</button><button data-edit="' + album.id + '" class="secondary" type="button">Edit</button><button data-delete-album="' + album.id + '" class="danger" type="button">Delete</button></div></article>').join("") || '<p class="empty">No albums yet. Create one when you are ready.</p>';
   byId("album-list").querySelectorAll("[data-run]").forEach((button) => button.addEventListener("click", () => albumAction(button.dataset.run, "run", "Album is running.")));
   byId("album-list").querySelectorAll("[data-stop]").forEach((button) => button.addEventListener("click", () => albumAction(button.dataset.stop, "stop", "Album stopped.")));
   byId("album-list").querySelectorAll("[data-edit]").forEach((button) => button.addEventListener("click", () => editAlbum(state.albums.find((album) => album.id === button.dataset.edit))));
@@ -445,10 +446,55 @@ async function deleteAlbum(id) {
   catch (error) { setMessage("album-message", error.message, "error"); }
 }
 async function loadAlbums() {
-  const results = await Promise.all([api("/api/v1/albums"), api("/api/v1/displays/" + displayId)]);
+  const results = await Promise.all([
+    api("/api/v1/albums"),
+    api("/api/v1/displays/" + displayId),
+    api("/api/v1/icloud/links"),
+  ]);
   state.albums = results[0];
+  state.icloudLinks = results[2];
+  renderIcloudLinks();
   renderAlbumList();
   renderDisplay(results[1]);
+}
+function renderIcloudLinks() {
+  byId("icloud-link-list").innerHTML = state.icloudLinks.map((link) => '<div class="icloud-link"><div><h3>' + escapeHtml(link.stream_name || "Shared album") + "</h3><p>" + link.photo_count + " photo" + (link.photo_count === 1 ? "" : "s") + " · checked " + escapeHtml(lastCheckInLabel(link.last_success_at)) + (link.enabled ? "" : " · paused") + "</p>" + (link.last_error ? '<p class="error">' + escapeHtml(link.last_error) + "</p>" : "") + '</div><div class="actions"><button data-sync-icloud="' + link.id + '" class="secondary" type="button">Sync now</button><button data-unlink-icloud="' + link.id + '" class="danger" type="button">Unlink</button></div></div>').join("") || '<p class="empty">No shared albums linked yet.</p>';
+  byId("icloud-link-list").querySelectorAll("[data-sync-icloud]").forEach((button) => button.addEventListener("click", () => syncIcloudLink(button.dataset.syncIcloud, button)));
+  byId("icloud-link-list").querySelectorAll("[data-unlink-icloud]").forEach((button) => button.addEventListener("click", () => unlinkIcloud(button.dataset.unlinkIcloud)));
+}
+async function addIcloudLink() {
+  const field = byId("icloud-url");
+  const shareUrl = field.value.trim();
+  if (!shareUrl) { setMessage("icloud-message", "Paste a shared album link first.", "error"); return; }
+  const button = byId("add-icloud");
+  button.disabled = true;
+  // The first sync downloads every photo, so this request is slow by design.
+  setMessage("icloud-message", "Linking the album and fetching its photos…");
+  try {
+    const link = await api("/api/v1/icloud/links", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ share_url: shareUrl }) });
+    field.value = "";
+    setMessage("icloud-message", link.last_error || ("Linked " + (link.stream_name || "the album") + "."), link.last_error ? "error" : "");
+    await loadAlbums();
+  } catch (error) { setMessage("icloud-message", error.message, "error"); }
+  finally { button.disabled = false; }
+}
+async function syncIcloudLink(id, button) {
+  button.disabled = true;
+  setMessage("icloud-message", "Checking the album for changes…");
+  try {
+    const link = await api("/api/v1/icloud/links/" + id + "/sync", { method: "POST" });
+    setMessage("icloud-message", link.last_error || "Album is up to date.", link.last_error ? "error" : "");
+    await loadAlbums();
+  } catch (error) { setMessage("icloud-message", error.message, "error"); }
+  finally { button.disabled = false; }
+}
+async function unlinkIcloud(id) {
+  if (!window.confirm("Stop syncing this shared album? Its photos stay in your gallery.")) return;
+  try {
+    await api("/api/v1/icloud/links/" + id, { method: "DELETE" });
+    setMessage("icloud-message", "Album unlinked.");
+    await loadAlbums();
+  } catch (error) { setMessage("icloud-message", error.message, "error"); }
 }
 async function uploadAlbumImages(fileList) {
   const files = [...fileList];
@@ -541,6 +587,8 @@ byId("stop-playback").addEventListener("click", stopPlayback);
 byId("play-selected").addEventListener("click", openQuickPlay);
 byId("delete-selected").addEventListener("click", () => deleteAssets(selectedGalleryIds()).catch((error) => setMessage("gallery-message", error.message, "error")));
 byId("new-album").addEventListener("click", startNewAlbum);
+byId("add-icloud").addEventListener("click", addIcloudLink);
+byId("icloud-url").addEventListener("keydown", (event) => { if (event.key === "Enter") { event.preventDefault(); addIcloudLink(); } });
 byId("back-to-albums").addEventListener("click", closeAlbumEditor);
 byId("cancel-album-edit").addEventListener("click", closeAlbumEditor);
 byId("open-album-picker").addEventListener("click", () => openAlbumPicker());

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from uuid import uuid4
@@ -11,6 +12,14 @@ from uuid import uuid4
 from fastapi import HTTPException, UploadFile, status
 
 ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/webp"}
+
+
+class StorageError(Exception):
+    """A stored file could not be written. The message is safe to show a user."""
+
+
+class StorageTooLargeError(StorageError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -45,20 +54,40 @@ class Storage:
                 detail="Only JPEG, PNG, and WebP image uploads are supported",
             )
 
-        filename = Path(upload.filename or "upload").name[:255]
+        async def chunks() -> AsyncIterator[bytes]:
+            while chunk := await upload.read(1024 * 1024):
+                yield chunk
+
+        try:
+            return await self.save_stream(chunks(), upload.filename or "upload", mime_type, max_bytes)
+        except StorageTooLargeError as error:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail=str(error),
+            ) from error
+        finally:
+            await upload.close()
+
+    async def save_stream(
+        self,
+        chunks: AsyncIterator[bytes],
+        filename: str,
+        mime_type: str,
+        max_bytes: int,
+    ) -> StoredUpload:
+        """Hash and store a streamed image, stopping as soon as it grows past the limit."""
+
+        safe_filename = Path(filename).name[:255] or "upload"
         temporary_path = self.tmp / f"{uuid4()}.upload"
         digest = hashlib.sha256()
         file_size = 0
 
         try:
             with temporary_path.open("xb") as output:
-                while chunk := await upload.read(1024 * 1024):
+                async for chunk in chunks:
                     file_size += len(chunk)
                     if file_size > max_bytes:
-                        raise HTTPException(
-                            status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
-                            detail=f"Upload exceeds the {max_bytes // (1024 * 1024)} MiB limit",
-                        )
+                        raise StorageTooLargeError(f"Image exceeds the {max_bytes // (1024 * 1024)} MiB limit")
                     digest.update(chunk)
                     output.write(chunk)
 
@@ -70,12 +99,10 @@ class Storage:
                 temporary_path.unlink()
             else:
                 os.replace(temporary_path, destination)
-            return StoredUpload(filename, mime_type, sha256, file_size, relative_path)
+            return StoredUpload(safe_filename, mime_type, sha256, file_size, relative_path)
         except Exception:
             temporary_path.unlink(missing_ok=True)
             raise
-        finally:
-            await upload.close()
 
     def write_artifact(self, content: bytes, sha256: str) -> str:
         relative_path = f"artifacts/{sha256[:2]}/{sha256}.png"

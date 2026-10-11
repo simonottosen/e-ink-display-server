@@ -58,6 +58,15 @@
             <button id="new-album" type="button">Create album</button>
           </div>
           <p id="album-message" class="message" aria-live="polite"></p>
+          <article class="card icloud-card">
+            <div class="section-heading small-heading"><div><p class="eyebrow">ICLOUD</p><h2>Shared albums</h2><p class="subtitle">Paste a shared album link and its photos stay in sync by themselves.</p></div></div>
+            <div class="icloud-add">
+              <input id="icloud-url" type="url" placeholder="https://share.icloud.com/photos/…" autocomplete="off">
+              <button id="add-icloud" type="button">Link album</button>
+            </div>
+            <p id="icloud-message" class="message" aria-live="polite"></p>
+            <div id="icloud-link-list" class="icloud-link-list"></div>
+          </article>
           <div id="album-list" class="album-list"></div>
         </div>
 

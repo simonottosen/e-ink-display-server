@@ -177,3 +177,39 @@ class QuickPlayRequest(BaseModel):
 class DeleteResult(BaseModel):
     deleted_ids: list[str]
 
+
+class IcloudLinkCreate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    share_url: str = Field(min_length=1, max_length=2048)
+    name: str | None = Field(default=None, max_length=120)
+    display_id: str = "inky-main"
+    interval_seconds: int = Field(default=1_200, ge=60, le=86_400)
+    sync_interval_seconds: int = Field(default=900, ge=60, le=86_400)
+
+
+class IcloudLinkUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool | None = None
+    sync_interval_seconds: int | None = Field(default=None, ge=60, le=86_400)
+
+
+class IcloudLinkResponse(BaseModel):
+    """Deliberately carries neither the token nor the share URL.
+
+    The token is a bearer capability for the whole album, and this API is unauthenticated.
+    """
+
+    id: str
+    album_id: str
+    stream_name: str
+    enabled: bool
+    sync_interval_seconds: int
+    photo_count: int
+    last_sync_at: datetime | None
+    last_success_at: datetime | None
+    next_sync_at: datetime | None
+    last_error: str | None
+    created_at: datetime
+

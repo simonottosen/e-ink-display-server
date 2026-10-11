@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     display_orientation: DisplayOrientation = DisplayOrientation.LANDSCAPE
     display_rotation_degrees: DisplayRotation = DisplayRotation.DEGREES_0
     display_time_zone: str = "Europe/Copenhagen"
+
+    icloud_sync_enabled: bool = True
+    icloud_sync_interval_seconds: int = 900
+    # A shared album holds up to 5000 photos; uncapped, the first sync is tens of gigabytes.
+    icloud_max_photos: int = 500
+    icloud_guid_chunk_size: int = 20
+    icloud_request_timeout_seconds: int = 30
+
     @cached_property
     def resolved_database_url(self) -> str:
         if self.database_url:

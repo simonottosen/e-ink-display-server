@@ -3,12 +3,13 @@
 from __future__ import annotations
 
 import logging
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from uuid import UUID, uuid4
 
+import httpx
 from fastapi import Depends, FastAPI, File, HTTPException, Request, Response, UploadFile, status
 from fastapi.responses import FileResponse
 from fastapi.staticfiles import StaticFiles
@@ -33,6 +34,7 @@ from .albums import AlbumScheduler, album_response, stop_album_record, stop_runn
 from .api_models import (
     AlbumCreate,
     AlbumItemsUpdate,
+    AlbumOrderMode,
     AlbumResponse,
     AlbumUpdate,
     AssetResponse,
@@ -41,9 +43,13 @@ from .api_models import (
     DeleteResult,
     DisplayResponse,
     DisplaySettingsUpdate,
+    IcloudLinkCreate,
+    IcloudLinkResponse,
+    IcloudLinkUpdate,
     JobResponse,
     QuickPlayRequest,
 )
+from .assets import upsert_asset
 from .config import Settings
 from .database import (
     AlbumItemRecord,
@@ -52,8 +58,12 @@ from .database import (
     AssetRecord,
     DisplayJobRecord,
     DisplayRecord,
+    IcloudAlbumLinkRecord,
+    IcloudPhotoRecord,
     create_session_factory,
 )
+from .icloud import IcloudShareError, parse_share_token
+from .icloud_sync import IcloudSyncService
 from .observability import configure_logging, request_id_context
 from .profiles import profile_from_record
 from .rendering import artifact_cache_key
@@ -217,6 +227,42 @@ def _display_response(session: Session, display: DisplayRecord) -> DisplayRespon
     )
 
 
+def _unique_album_name(session: Session, preferred: str, keep_id: str | None = None) -> str:
+    """Album names are unique, and two shared albums are both plausibly called "Family"."""
+
+    base = preferred.strip()[:110] or "Shared album"
+    for suffix in range(100):
+        candidate = base if suffix == 0 else f"{base} ({suffix + 1})"
+        clash = session.scalar(select(AlbumRecord).where(AlbumRecord.name == candidate))
+        if clash is None or clash.id == keep_id:
+            return candidate
+    return f"{base} {uuid4().hex[:8]}"
+
+
+def _icloud_link_response(link: IcloudAlbumLinkRecord) -> IcloudLinkResponse:
+    return IcloudLinkResponse(
+        id=link.id,
+        album_id=link.album_id,
+        stream_name=link.stream_name,
+        enabled=link.enabled,
+        sync_interval_seconds=link.sync_interval_seconds,
+        photo_count=link.photo_count,
+        last_sync_at=_as_utc(link.last_sync_at),
+        last_success_at=_as_utc(link.last_success_at),
+        next_sync_at=_as_utc(link.next_sync_at),
+        last_error=link.last_error,
+        created_at=link.created_at,
+    )
+
+
+def _icloud_link_response_by_id(sessions: sessionmaker[Session], link_id: str) -> IcloudLinkResponse:
+    with sessions() as session:
+        link = session.get(IcloudAlbumLinkRecord, link_id)
+        if link is None:
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Linked album not found")
+        return _icloud_link_response(link)
+
+
 def _report_stale_agent_revision(session: Session, display: DisplayRecord, agent_revision: int) -> None:
     """Surface a revision counter left over from an earlier database, which is otherwise silent."""
 
@@ -265,7 +311,10 @@ def _seed_display(sessions: sessionmaker[Session], settings: Settings) -> None:
         session.commit()
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(
+    settings: Settings | None = None,
+    icloud_client_factory: Callable[[], httpx.AsyncClient] | None = None,
+) -> FastAPI:
     runtime_settings = settings or Settings()
     configure_logging(runtime_settings.log_level)
 
@@ -276,17 +325,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         _seed_display(sessions, runtime_settings)
         worker = RenderWorker(sessions, storage, runtime_settings.max_source_pixels)
         album_scheduler = AlbumScheduler(sessions, worker)
+        icloud_sync = IcloudSyncService(sessions, storage, runtime_settings, icloud_client_factory)
         app.state.settings = runtime_settings
         app.state.sessions = sessions
         app.state.storage = storage
         app.state.worker = worker
         app.state.album_scheduler = album_scheduler
+        app.state.icloud_sync = icloud_sync
         await worker.start()
         await album_scheduler.start()
+        await icloud_sync.start()
         logger.info("host started", extra={"display_id": runtime_settings.display_id})
         try:
             yield
         finally:
+            await icloud_sync.stop()
             await album_scheduler.stop()
             await worker.stop()
             logger.info("host stopped")
@@ -338,20 +391,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         stored = await storage.save_upload(file, runtime.max_upload_bytes)
         sessions: sessionmaker[Session] = request.app.state.sessions
         with sessions() as session:
-            asset = session.scalar(select(AssetRecord).where(AssetRecord.sha256 == stored.sha256))
-            if asset is None:
-                asset = AssetRecord(
-                    id=str(uuid4()),
-                    original_filename=stored.filename,
-                    sha256=stored.sha256,
-                    storage_path=stored.relative_path,
-                    mime_type=stored.mime_type,
-                    file_size=stored.file_size,
-                    render_settings=RenderSettings().model_dump(mode="json"),
-                )
-                session.add(asset)
-            elif asset.deleted_at is not None:
-                asset.deleted_at = None
+            asset = upsert_asset(session, stored)
             session.commit()
             session.refresh(asset)
             response = _asset_response(asset)
@@ -610,6 +650,114 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 {"album_id": album.id},
             )
             session.delete(album)
+            session.commit()
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+
+    @app.post("/api/v1/icloud/links", response_model=IcloudLinkResponse, status_code=status.HTTP_201_CREATED)
+    async def create_icloud_link(body: IcloudLinkCreate, request: Request) -> IcloudLinkResponse:
+        try:
+            token = parse_share_token(body.share_url)
+        except IcloudShareError as error:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=str(error)) from error
+
+        sessions: sessionmaker[Session] = request.app.state.sessions
+        with sessions() as session:
+            display = session.get(DisplayRecord, body.display_id)
+            if display is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Display not found")
+            existing = session.scalar(
+                select(IcloudAlbumLinkRecord).where(IcloudAlbumLinkRecord.token == token)
+            )
+            if existing is not None:
+                raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="That album is already linked")
+            album = AlbumRecord(
+                id=str(uuid4()),
+                display_id=body.display_id,
+                name=_unique_album_name(session, body.name or "Shared album"),
+                order_mode=AlbumOrderMode.SHUFFLE.value,
+                interval_seconds=body.interval_seconds,
+                enabled=True,
+                time_zone=display.time_zone,
+                default_render_settings=RenderSettings().model_dump(mode="json"),
+            )
+            session.add(album)
+            session.flush()
+            link = IcloudAlbumLinkRecord(
+                id=str(uuid4()),
+                album_id=album.id,
+                token=token,
+                share_url=body.share_url,
+                base_url="",
+                stream_name=album.name,
+                sync_interval_seconds=body.sync_interval_seconds,
+                next_sync_at=datetime.now(UTC),
+            )
+            session.add(link)
+            session.commit()
+            link_id = link.id
+
+        # Run the first pass inline so the UI shows photos instead of an empty album.
+        await request.app.state.icloud_sync.sync_link(link_id)
+        with sessions() as session:
+            link = session.get(IcloudAlbumLinkRecord, link_id)
+            if link is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Linked album not found")
+            album = session.get(AlbumRecord, link.album_id)
+            if body.name is None and album is not None and link.stream_name:
+                album.name = _unique_album_name(session, link.stream_name, album.id)
+                session.commit()
+            return _icloud_link_response(link)
+
+    @app.get("/api/v1/icloud/links", response_model=list[IcloudLinkResponse])
+    def list_icloud_links(request: Request) -> list[IcloudLinkResponse]:
+        sessions: sessionmaker[Session] = request.app.state.sessions
+        with sessions() as session:
+            links = session.scalars(
+                select(IcloudAlbumLinkRecord).order_by(desc(IcloudAlbumLinkRecord.created_at))
+            ).all()
+            return [_icloud_link_response(link) for link in links]
+
+    @app.patch("/api/v1/icloud/links/{link_id}", response_model=IcloudLinkResponse)
+    def update_icloud_link(link_id: str, body: IcloudLinkUpdate, request: Request) -> IcloudLinkResponse:
+        sessions: sessionmaker[Session] = request.app.state.sessions
+        with sessions() as session:
+            link = session.get(IcloudAlbumLinkRecord, link_id)
+            if link is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Linked album not found")
+            if body.enabled is not None:
+                link.enabled = body.enabled
+            if body.sync_interval_seconds is not None:
+                link.sync_interval_seconds = body.sync_interval_seconds
+            session.commit()
+            return _icloud_link_response(link)
+
+    @app.post("/api/v1/icloud/links/{link_id}/sync", response_model=IcloudLinkResponse)
+    async def sync_icloud_link(link_id: str, request: Request) -> IcloudLinkResponse:
+        sessions: sessionmaker[Session] = request.app.state.sessions
+        with sessions() as session:
+            if session.get(IcloudAlbumLinkRecord, link_id) is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Linked album not found")
+        await request.app.state.icloud_sync.sync_link(link_id, force=True)
+        return _icloud_link_response_by_id(sessions, link_id)
+
+    @app.delete("/api/v1/icloud/links/{link_id}")
+    def delete_icloud_link(link_id: str, request: Request, delete_album: bool = False) -> Response:
+        sessions: sessionmaker[Session] = request.app.state.sessions
+        with sessions() as session:
+            link = session.get(IcloudAlbumLinkRecord, link_id)
+            if link is None:
+                raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Linked album not found")
+            album = session.get(AlbumRecord, link.album_id)
+            session.execute(delete(IcloudPhotoRecord).where(IcloudPhotoRecord.link_id == link.id))
+            session.delete(link)
+            if delete_album and album is not None:
+                stop_album_record(session, album)
+                session.execute(delete(AlbumItemRecord).where(AlbumItemRecord.album_id == album.id))
+                session.execute(
+                    text("UPDATE display_jobs SET album_id = NULL WHERE album_id = :album_id"),
+                    {"album_id": album.id},
+                )
+                session.delete(album)
             session.commit()
         return Response(status_code=status.HTTP_204_NO_CONTENT)
 
